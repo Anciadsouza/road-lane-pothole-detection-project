@@ -1,0 +1,4 @@
+# Install alongside the existing .venv; these are API additions only.
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+python-multipart>=0.0.9

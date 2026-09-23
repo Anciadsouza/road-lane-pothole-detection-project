@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+.DS_Store
+assets/.DS_Store
+runs/
+models/
+Pothole_Detection.py
+test_pothole.py
+Pothole-Detection-Project--1/
+YOLOv8_Segmentation_DeepSORT_Object_Tracking/
+frontend/node_modules/
+frontend/dist/
