@@ -10,7 +10,8 @@ from typing import Callable
 import cv2
 import numpy as np
 
-from .detector import is_pothole_class, load_model
+from .detector import inference_runtime, is_pothole_class, load_model
+from .forward_alerts import ForwardAlertTimeline
 from .lane_detector import (LaneDetector, draw_lane_overlay, is_in_current_lane,
                              is_on_drivable_road)
 from .severity import score_severity
@@ -40,11 +41,13 @@ def process_video(source: Path, output: Path, progress: Callable[[int, str], Non
         raise RuntimeError("FFmpeg is required for video processing. Install FFmpeg and retry.")
     width, height, fps, frame_count = _probe(source)
     model = load_model()
+    device = str(model.device)
     lane_detector = LaneDetector(width, height, fps=fps)
     tracker = CentroidTracker()
+    forward_alerts = ForwardAlertTimeline(fps, height)
     output.parent.mkdir(parents=True, exist_ok=True)
     decoder = subprocess.Popen([ffmpeg, "-v", "error", "-i", str(source), "-f", "rawvideo",
-        "-pix_fmt", "bgr24", "-vsync", "0", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        "-pix_fmt", "bgr24", "-fps_mode", "passthrough", "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     encoder = subprocess.Popen([ffmpeg, "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0", "-an", "-c:v", "libx264",
         "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)],
@@ -84,7 +87,7 @@ def process_video(source: Path, output: Path, progress: Callable[[int, str], Non
             lane_status_counts[lane_geometry.tracking_status] += 1
             # Run unchanged YOLO inference on the decoded road frame before
             # adding any lane or box visualization overlays.
-            result = model.predict(frame, conf=0.25, imgsz=640, device="cpu", verbose=False)[0]
+            result = model.predict(frame, conf=0.25, imgsz=640, device=device, verbose=False)[0]
             draw_lane_overlay(frame, lane_geometry)
             frame_detections: list[dict] = []
             if result.boxes is not None:
@@ -150,6 +153,9 @@ def process_video(source: Path, output: Path, progress: Callable[[int, str], Non
                 elif d["lane"] == "uncertain" and is_new and track_id not in current_event_ids:
                     uncertain_unique.add(track_id)
 
+                if d["lane"] == "current":
+                    forward_alerts.observe(track_id, display_id, frame_index, d["cy"], d["confidence"])
+
                 # Red is reserved for a detected pothole, irrespective of its
                 # lane relevance. The short label carries its association.
                 pothole_red = (42, 48, 232)  # BGR
@@ -196,7 +202,12 @@ def process_video(source: Path, output: Path, progress: Callable[[int, str], Non
     lighting_condition, lighting_luminance = classify_lighting(lighting_samples)
     current_confidence = last_lane_geometry.confidence if last_lane_geometry is not None else 0.0
     current_lane_status = last_lane_geometry.tracking_status if last_lane_geometry is not None else "UNCERTAIN"
+    alert_intervals = forward_alerts.finish(frame_index)
     return {"video": source.name, "frame_count": frame_index,
+        **inference_runtime(device),
+        "fps": round(fps, 4), "forward_alerts": alert_intervals,
+        "forward_alert_count": len(alert_intervals),
+        "forward_alert_method": "Repeated ego-lane detections with road contact above 72% of image height; visual position, not measured distance",
         "raw_yolo_detections": raw_count, "total_unique_potholes": total_unique,
         "unique_detections": total_unique,
         "ego_lane": 1, "ego_lane_potholes": ego_count,

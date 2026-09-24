@@ -11,3 +11,9 @@ Pothole-Detection-Project--1/
 YOLOv8_Segmentation_DeepSORT_Object_Tracking/
 frontend/node_modules/
 frontend/dist/
+Major Project/
+
+# Local inputs and downloaded model artifacts; keep the bundled demo tracked.
+assets/Car_driving_on_Indian_road_*.mp4
+/download (*)
+/best.pt*.metadata

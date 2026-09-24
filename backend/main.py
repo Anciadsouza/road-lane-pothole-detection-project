@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .video_processor import process_video
+from .detector import inference_runtime
 
 ROOT = Path(__file__).resolve().parents[1]
 JOB_ROOT = ROOT / "runs" / "dashboard"
@@ -63,7 +64,7 @@ def _create_job(source: Path, display_name: str) -> str:
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "model_available": (ROOT / "models" / "best.pt").is_file(),
-            "demo_available": DEMO_VIDEO.is_file()}
+            "demo_available": DEMO_VIDEO.is_file(), **inference_runtime()}
 
 
 @app.post("/api/process")

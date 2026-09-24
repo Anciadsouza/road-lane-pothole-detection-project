@@ -17,7 +17,9 @@ LANE_CONFIG = {
     "roi_bottom": 0.86,
     "camera_x": 0.50,
     "camera_boundary_margin": 0.010,
-    "expected_lane_width_anchor": 0.27,
+    "expected_lane_width_anchor": 0.45,
+    "min_lane_width_anchor": 0.07,
+    "max_lane_width_anchor": 0.85,
     "anchor_y": 0.72,
     "canny_low": 42,
     "canny_high": 132,
@@ -25,12 +27,18 @@ LANE_CONFIG = {
     "min_line_length": 38,
     "max_line_gap": 72,
     "min_abs_dx_dy": 0.20,
-    "max_abs_dx_dy": 3.2,
+    "max_abs_dx_dy": 4.5,
+    "max_boundary_extrapolation_fraction": 0.35,
     "cluster_anchor_fraction": 0.085,
     "cluster_slope_tolerance": 1.15,
-    "smoothing_factor": 0.42,
-    "max_boundary_jump_fraction": 0.22,
+    "smoothing_factor": 0.30,
+    "min_smoothing_factor": 0.10,
+    "max_boundary_jump_fraction": 0.055,
+    "max_boundary_step_fraction": 0.012,
+    "switch_confirm_frames": 3,
+    "switch_consistency_fraction": 0.025,
     "confidence_threshold": 0.32,
+    "acquire_confidence_threshold": 0.42,
     # Keep the last measured lane for a brief period at the clip's frame rate.
     "max_hold_seconds": 0.65,
     "max_hold_frames": 18,  # used when caller does not supply FPS
@@ -45,6 +53,7 @@ LANE_CONFIG = {
     "road_value_min": 34,
     "road_value_max": 238,
     "sample_count": 12,
+    "paint_contrast_min": 8,
     "debug": os.getenv("DEBUG_LANES", "false").casefold() in {"1", "true", "yes", "on"},
 }
 
@@ -102,6 +111,48 @@ class LaneDetector:
         self._low_light = False
         self._low_contrast = False
         self._enhanced_gray: np.ndarray | None = None
+        self._pending_boundaries: dict[str, tuple[np.ndarray, int]] = {}
+
+    def _pair_start(self, left: np.ndarray | None, right: np.ndarray | None) -> int | None:
+        """Validate observed and temporarily predicted pairs by the same rules."""
+        if left is None or right is None:
+            return None
+        anchor = int(np.argmin(abs(self.y_norm - self.config["anchor_y"])))
+        anchor_width = float(right[anchor] - left[anchor])
+        if not (self.config["min_lane_width_anchor"] <= anchor_width <= self.config["max_lane_width_anchor"]
+                and left[anchor] < self.camera_x < right[anchor]):
+            return None
+        ordered = left + 0.006 < right
+        starts = [i for i in range(len(ordered)) if bool(np.all(ordered[i:]))]
+        if not starts or len(ordered) - starts[0] < 4:
+            return None
+        start = starts[0]
+        bottom_width = float(right[-1] - left[-1])
+        top_width = float(right[start] - left[start])
+        if not (0.08 <= bottom_width <= 0.96 and
+                0.72 <= bottom_width / anchor_width <= 3.8 and
+                0 < top_width <= bottom_width * 1.22):
+            return None
+        return start
+
+    def _select_visible_side(self, candidates: list[tuple[np.ndarray, float, float]],
+                             side: str) -> np.ndarray | None:
+        """Keep a measured side alive only when it agrees with recent lane history."""
+        previous = self._left if side == "left" else self._right
+        opposite = self._right if side == "left" else self._left
+        if previous is None or opposite is None:
+            return None
+        options = []
+        for curve, quality, _ in candidates:
+            error = float(np.quantile(np.abs(curve - previous), 0.9))
+            pair = (curve, opposite) if side == "left" else (opposite, curve)
+            if error <= self.config["max_boundary_jump_fraction"] and self._pair_start(*pair) is not None:
+                options.append((quality - error / self.config["max_boundary_jump_fraction"], curve, quality))
+        if not options:
+            return None
+        _, curve, quality = max(options, key=lambda item: item[0])
+        setattr(self, f"_{side}_fit_quality", quality)
+        return curve
 
     def _lane_preprocess(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
         """Create a lane-only enhanced grayscale image and a bright-glare mask."""
@@ -127,7 +178,7 @@ class LaneDetector:
             x, y, w, h, area = stats[component]
             # Small/thin saturated lane paint stays eligible; only broad
             # headlamp-like clipped blobs are treated as glare.
-            if area >= 36 and w >= 6 and h >= 6:
+            if low_light and area >= 36 and w >= 6 and h >= 6 and 0.4 <= w / h <= 2.5 and area / (w * h) > 0.45:
                 glare[labels == component] = 255
         k = max(3, int(self.config["glare_dilate_size"]) | 1)
         glare = cv2.dilate(glare, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
@@ -154,6 +205,21 @@ class LaneDetector:
         high = max(low + 40, int(self.config["canny_high"] * (0.82 if enhanced else 1.0)))
         edges = cv2.Canny(gray, low, high)
         edges[glare > 0] = 0
+        # Require narrow, locally brighter white/yellow paint near an edge.
+        # A road-wide shadow boundary can pass Canny and brightness checks but
+        # should not be treated as a lane stripe.
+        source_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        kernel_size = max(9, round(self.width * 0.025) | 1)
+        contrast = cv2.morphologyEx(source_gray, cv2.MORPH_TOPHAT,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size)))
+        road_values = source_gray[round(self.config["roi_top"] * self.height):round(self.config["roi_bottom"] * self.height)]
+        paint_floor = min(200, max(90, float(np.median(road_values)) + 20)) if road_values.size else 145
+        white = (hsv[:, :, 1] < 90) & (hsv[:, :, 2] >= paint_floor)
+        yellow = (hsv[:, :, 0] >= 12) & (hsv[:, :, 0] <= 38) & (hsv[:, :, 1] >= 70) & (hsv[:, :, 2] >= 100)
+        paint = ((white | yellow) & (contrast >= self.config["paint_contrast_min"])).astype(np.uint8) * 255
+        paint = cv2.dilate(paint, np.ones((5, 5), np.uint8))
+        edges = cv2.bitwise_and(edges, paint)
         mask = np.zeros_like(edges)
         y0 = round(self.config["roi_top"] * self.height)
         y1 = round(self.config["roi_bottom"] * self.height)
@@ -207,9 +273,13 @@ class LaneDetector:
             else:
                 side = "left" if slope < 0 else "right"
             margin = self.config["camera_boundary_margin"] * self.width
-            if side == "left" and not 0 <= x_anchor < camera_px - margin:
+            # A visible road edge can leave the crop above the anchor row.
+            # Keep bounded off-screen projections; fitting clips the polygon
+            # to the image. Requiring x_anchor in [0, width] loses these lanes.
+            extension = self.config["max_boundary_extrapolation_fraction"] * self.width
+            if side == "left" and not -extension <= x_anchor < camera_px - margin:
                 continue
-            if side == "right" and not camera_px + margin < x_anchor < self.width:
+            if side == "right" and not camera_px + margin < x_anchor < self.width + extension:
                 continue
             count = max(5, int(length / 12))
             xs = np.linspace(x1, x2, count).astype(int).clip(0, self.width - 1)
@@ -272,25 +342,15 @@ class LaneDetector:
     def _select_lane_pair(self, left_candidates: list[tuple[np.ndarray, float, float]],
                           right_candidates: list[tuple[np.ndarray, float, float]]) -> tuple[np.ndarray | None, np.ndarray | None]:
         if not left_candidates or not right_candidates:
-            return None, None
+            return (self._select_visible_side(left_candidates, "left"),
+                    self._select_visible_side(right_candidates, "right"))
         anchor = int(np.argmin(abs(self.y_norm - self.config["anchor_y"])))
         target_width = self._last_lane_width or self.config["expected_lane_width_anchor"]
         options = []
         for left, lq, lp in left_candidates:
             for right, rq, rp in right_candidates:
                 anchor_width = float(right[anchor] - left[anchor])
-                if not (0.07 <= anchor_width <= 0.52 and left[anchor] < self.camera_x < right[anchor]):
-                    continue
-                ordered = left + 0.006 < right
-                starts = [idx for idx in range(len(ordered)) if bool(np.all(ordered[idx:]))]
-                if not starts:
-                    continue
-                start = starts[0]
-                if len(ordered) - start < 4:
-                    continue
-                bottom_width = float(right[-1] - left[-1])
-                if not (0.08 <= bottom_width <= 0.96 and
-                        0.72 <= bottom_width / max(anchor_width, 1e-3) <= 3.8):
+                if self._pair_start(left, right) is None:
                     continue
                 center_error = abs(float((left[anchor] + right[anchor]) * 0.5) - self.camera_x)
                 center_score = float(np.exp(-center_error / 0.20))
@@ -304,8 +364,8 @@ class LaneDetector:
                 support_score = min(1.0, (lq + rq) * 0.5)
                 # Rank complete pairs: image-center proximity alone cannot
                 # select an adjacent lane, and width/history reject stripe pairs.
-                score = (0.30 * support_score + 0.23 * center_score +
-                         0.31 * width_score + 0.16 * temporal_score)
+                score = (0.30 * support_score + 0.15 * center_score +
+                         0.25 * width_score + 0.30 * temporal_score)
                 options.append((score, left, right, lq, rq))
         if not options:
             return None, None
@@ -322,19 +382,28 @@ class LaneDetector:
             return None
         ys = points[:, 1] / self.height
         xs = points[:, 0] / self.width
-        degree = min(2, len(np.unique(np.round(ys, 3))) - 1)
+        # Short/dashed observations cannot constrain a quadratic extrapolation.
+        # Start linear and allow curvature only with broad vertical support and
+        # a materially better fit to the observed marking points.
+        degree = min(1, len(np.unique(np.round(ys, 3))) - 1)
         if degree < 1:
             return None
         weights = np.sqrt(np.asarray([item["length"] for item in cluster], dtype=np.float32))
         weights = np.repeat(weights, 2)[keep]
         try:
             coefficients = np.polyfit(ys, xs, degree, w=weights)
+            if len(cluster) >= 4 and float(np.ptp(ys)) >= 0.30 and len(np.unique(np.round(ys, 4))) >= 3:
+                quadratic = np.polyfit(ys, xs, 2, w=weights)
+                linear_error = float(np.mean((xs - np.polyval(coefficients, ys)) ** 2))
+                curved_error = float(np.mean((xs - np.polyval(quadratic, ys)) ** 2))
+                if curved_error < linear_error * 0.65 and abs(quadratic[0]) < 1.5:
+                    degree, coefficients = 2, quadratic
             for _ in range(2):
                 residual = np.abs(xs - np.polyval(coefficients, ys))
                 median = float(np.median(residual))
                 mad = float(np.median(np.abs(residual - median)))
                 inliers = residual <= max(0.012, median + 2.8 * mad)
-                if int(inliers.sum()) < max(4, degree + 1):
+                if int(inliers.sum()) < max(4, degree + 1) or len(np.unique(np.round(ys[inliers], 4))) <= degree:
                     break
                 coefficients = np.polyfit(ys[inliers], xs[inliers], degree, w=weights[inliers])
             curve = np.polyval(coefficients, self.y_norm)
@@ -373,14 +442,22 @@ class LaneDetector:
         missed = self._missed_left if side == "left" else self._missed_right
         previous_confidence = self._left_base_confidence if side == "left" else self._right_base_confidence
         if detected is not None:
-            anchor = int(np.argmin(abs(self.y_norm - self.config["anchor_y"])))
-            jump = abs(float(detected[anchor] - previous[anchor])) if previous is not None else 0.0
-            if previous is not None and missed <= self.config["max_hold_frames"] and jump > self.config["max_boundary_jump_fraction"]:
-                detected = None
+            jump = float(np.quantile(np.abs(detected - previous), 0.9)) if previous is not None else 0.0
+            if previous is not None and jump > self.config["max_boundary_jump_fraction"]:
+                pending, count = self._pending_boundaries.get(side, (detected, 0))
+                consistent = float(np.quantile(np.abs(detected - pending), 0.9)) <= self.config["switch_consistency_fraction"]
+                count = count + 1 if consistent else 1
+                self._pending_boundaries[side] = (detected.copy(), count)
+                if count < self.config["switch_confirm_frames"]:
+                    detected = None
             else:
-                alpha = self.config["smoothing_factor"]
-                smoothed = detected if previous is None else previous * (1 - alpha) + detected * alpha
+                self._pending_boundaries.pop(side, None)
+            if detected is not None:
                 marking = self._left_fit_quality if side == "left" else self._right_fit_quality
+                alpha = self.config["min_smoothing_factor"] + (
+                    self.config["smoothing_factor"] - self.config["min_smoothing_factor"]) * np.clip(marking, 0, 1)
+                step = self.config["max_boundary_step_fraction"]
+                smoothed = detected if previous is None else previous + np.clip((detected - previous) * alpha, -step, step)
                 temporal = (float(np.exp(-float(np.mean(np.abs(detected - previous))) / 0.04))
                             if previous is not None else 0.72)
                 confidence = 0.72 * marking + 0.28 * temporal
@@ -391,6 +468,8 @@ class LaneDetector:
                     self._right, self._missed_right = smoothed, 0
                     self._right_confidence = self._right_base_confidence = confidence
                 return smoothed, True, confidence
+        else:
+            self._pending_boundaries.pop(side, None)
         missed += 1
         if side == "left":
             self._missed_left = missed
@@ -403,6 +482,7 @@ class LaneDetector:
         if missed > self.config["max_hold_frames"]:
             previous, confidence = None, 0.0
             previous_confidence = 0.0
+            self._pending_boundaries.pop(side, None)
         if side == "left":
             self._left, self._left_confidence, self._left_base_confidence = previous, confidence, previous_confidence
         else:
@@ -417,24 +497,28 @@ class LaneDetector:
         left_candidates = self._fit_side_candidates(segments, "left")
         right_candidates = self._fit_side_candidates(segments, "right")
         selected_left, selected_right = self._select_lane_pair(left_candidates, right_candidates)
+        previous_left, previous_right = self._left, self._right
         left, left_detected, left_conf = self._smooth(selected_left, "left")
         right, right_detected, right_conf = self._smooth(selected_right, "right")
+        # Carry the last observed width profile with the visible marking. This
+        # prediction never resets the missing side's age or confidence decay.
+        if left_detected and not right_detected and right is not None and previous_left is not None:
+            predicted = np.clip(right + left - previous_left, 0, 1)
+            if self._pair_start(left, predicted) is not None:
+                right = self._right = predicted
+        elif right_detected and not left_detected and left is not None and previous_right is not None:
+            predicted = np.clip(left + right - previous_right, 0, 1)
+            if self._pair_start(predicted, right) is not None:
+                left = self._left = predicted
         anchor_idx = int(np.argmin(abs(self.y_norm - self.config["anchor_y"])))
-        start_idx = None
-        if left is not None and right is not None:
-            ordered = (left + 0.006) < right
-            for candidate in range(len(ordered)):
-                if bool(np.all(ordered[candidate:])):
-                    start_idx = candidate
-                    break
-        valid = (left is not None and right is not None and start_idx is not None
-                 and len(self.y_norm) - start_idx >= 4)
+        start_idx = self._pair_start(left, right)
+        valid = start_idx is not None
         measured = bool(left_detected and right_detected and valid)
         width_ok = True
         taper_ok = True
         if measured:
             lane_width = float(right[anchor_idx] - left[anchor_idx])
-            width_ok = 0.07 <= lane_width <= 0.52
+            width_ok = self.config["min_lane_width_anchor"] <= lane_width <= self.config["max_lane_width_anchor"]
             width_consistency = float(np.exp(-abs(lane_width - (self._last_lane_width or
                                       self.config["expected_lane_width_anchor"])) / 0.13))
             # The top of a forward-road lane should converge relative to its
@@ -460,13 +544,16 @@ class LaneDetector:
             if width_ok:
                 self._last_lane_width = lane_width if self._last_lane_width is None else (
                     0.75 * self._last_lane_width + 0.25 * lane_width)
-            self._last_valid_frame = self._frame_index
         elif valid:
             confidence = min(left_conf, right_conf)
         else:
             confidence = 0.0
         plausible_geometry = not measured or (width_ok and taper_ok)
-        reliable = valid and plausible_geometry and confidence >= self.config["confidence_threshold"]
+        was_reliable = self._last_status in {"TRACKED", "TEMPORARILY_OCCLUDED"}
+        threshold = self.config["confidence_threshold"] if was_reliable else self.config["acquire_confidence_threshold"]
+        reliable = valid and plausible_geometry and confidence >= threshold
+        if reliable and measured:
+            self._last_valid_frame = self._frame_index
         if reliable:
             if measured:
                 status = "TRACKED"
@@ -492,8 +579,9 @@ class LaneDetector:
         if left_points is not None and right_points is not None and start_idx is not None:
             vanishing = (int((left_points[start_idx, 0] + right_points[start_idx, 0]) / 2),
                          int((left_points[start_idx, 1] + right_points[start_idx, 1]) / 2))
-        visible_left = left_points[start_idx:] if left_points is not None and start_idx is not None else left_points
-        visible_right = right_points[start_idx:] if right_points is not None and start_idx is not None else right_points
+        # Do not draw crossed or otherwise invalid boundaries as a lane.
+        visible_left = left_points[start_idx:] if valid else None
+        visible_right = right_points[start_idx:] if valid else None
         return LaneGeometry(polygon, visible_left, visible_right,
             [segment["line"] for segment in segments], edge_map, road_mask, left_detected, right_detected,
             self.camera_x, self.config["anchor_y"], self.config["debug"], confidence, reliable,
@@ -528,14 +616,18 @@ def draw_lane_overlay(frame: np.ndarray, geometry: LaneGeometry) -> np.ndarray:
     anchor_y = int(geometry.anchor_y * frame.shape[0])
     camera_x = int(geometry.camera_x * frame.shape[1])
     cv2.line(frame, (camera_x, anchor_y), (camera_x, frame.shape[0] - 1), (210, 205, 95), 1, cv2.LINE_AA)
-    state_label = {"TRACKED": "EGO LANE · TRACKED", "TEMPORARILY_OCCLUDED": "EGO LANE · TEMPORARILY OCCLUDED",
-                   "LOW_CONFIDENCE": "EGO LANE · LOW CONFIDENCE", "UNCERTAIN": "LANE DETECTION UNCERTAIN"}
-    label = f"{state_label[geometry.tracking_status]} · {geometry.confidence:.0%}"
-    text_x = (int((geometry.left_boundary[0, 0] + geometry.right_boundary[0, 0]) / 2)
-              if geometry.left_boundary is not None and geometry.right_boundary is not None else camera_x)
-    label_y = int(geometry.left_boundary[0, 1] - 12) if geometry.left_boundary is not None else anchor_y - 10
-    cv2.putText(frame, label, (max(8, text_x - 100), max(25, label_y)),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (70, 245, 185), 2, cv2.LINE_AA)
+    # Keep status clear of pothole boxes and use ASCII supported by Hershey fonts.
+    state_label = {"TRACKED": "EGO LANE | TRACKED", "TEMPORARILY_OCCLUDED": "EGO LANE | TEMPORARILY OCCLUDED",
+                   "LOW_CONFIDENCE": "EGO LANE | LOW CONFIDENCE", "UNCERTAIN": "LANE DETECTION UNCERTAIN"}
+    label = f"{state_label[geometry.tracking_status]} | {geometry.confidence:.0%}"
+    font_scale = min(0.62, max(0.35, frame.shape[1] / 1600))
+    (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+    text_x = max(8, frame.shape[1] - text_width - 14)
+    label_y = frame.shape[0] // 4 + 32 if geometry.debug else text_height + 16
+    cv2.rectangle(frame, (text_x - 6, label_y - text_height - 6),
+                  (text_x + text_width + 6, label_y + baseline + 5), (28, 35, 39), -1)
+    cv2.putText(frame, label, (text_x, label_y), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, (70, 245, 185), 1, cv2.LINE_AA)
 
     if geometry.debug:
         if geometry.centerline is not None:

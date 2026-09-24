@@ -1,96 +1,101 @@
-# Roadwatch — YOLOv8 Pothole Detection Dashboard
+# Roadwatch — pothole video analysis
 
-A local, CPU-based road video analysis dashboard built around the project's existing trained YOLOv8 weights. It detects lane markings dynamically from each frame, associates potholes with the camera's ego lane, tracks events, shows red hazard boxes and a video-derived DAY/NIGHT indicator, and presents lane confidence and visual risk estimates in a browser. Vehicle speed remains N/A because the video has no physical speed source or calibrated scale.
+Roadwatch analyzes **recorded road videos** with the project's trained YOLOv8 pothole model. It detects lane markings, groups repeated detections of the same pothole, and shows which detections fall in the camera vehicle's lane. The app starts with a minimal upload/results page; a separate detailed dashboard shows the event log, lane diagnostics, and alert timeline.
 
-## Existing project assets
+> **This is an offline video-analysis prototype, not a live in-car warning system.** The app processes the full uploaded clip before showing its annotated video and results. Playback warnings are synchronized to that processed clip; they are not issued while a car is driving.
 
-- `models/best.pt` is the existing trained Pothole model and is loaded directly. It is not retrained, replaced, or modified.
-- `assets/final.mp4` is the built-in 10-second demo input.
-- `Pothole_Detection.py` and `Pothole_Detection.ipynb` remain as the original inference script and historical notebook. The notebook's Colab, Drive, and Roboflow steps are not used by the dashboard.
-- The original direct YOLO inference call remains in `Pothole_Detection.py`; the web processor uses the same weights, class, and confidence threshold, with frame-wise inference to add lane-aware annotations.
+## What it shows
 
-## Architecture
+- Annotated MP4 with pothole boxes and the estimated current-lane region.
+- Counts for potholes in the current lane and outside it, plus a tracked-event log in the detailed view.
+- An amber **Pothole ahead** message during playback when a tracked current-lane pothole was repeatedly detected farther up the frame.
+- Local GPU inference when a compatible CUDA-enabled PyTorch installation is available; CPU is the fallback.
+- A visual risk estimate and a DAY/NIGHT scene indicator in the detailed view.
 
-```text
-React + Vite browser → FastAPI → FFmpeg frame decode/encode → OpenCV overlays
-                                                     ↘ existing YOLOv8 best.pt
-Processed MP4 + JSON statistics ← lane filtering + event tracking + visual risk score
-```
-
-The app processes videos locally. It does not use Google Drive, Roboflow, a downloaded model, CUDA, or retraining. FFmpeg/FFprobe are used for video I/O because they are reliable on the current macOS setup; OpenCV draws and evaluates the lane geometry.
+The amber warning uses image position, **not measured distance**. Speed, pothole depth, and stopping time are not measured by this project.
 
 ## Requirements
 
-- macOS with the existing project `.venv` (Python 3.11, PyTorch 2.2.2, existing Ultralytics 8.0.200)
-- Node.js and npm
-- FFmpeg and FFprobe available on `PATH` (`brew install ffmpeg` if missing)
+- Python 3.11, Node.js/npm, FFmpeg and FFprobe on `PATH`.
+- The trained pothole weights at **`models/best.pt`**. The `models/` directory is excluded from Git, so obtain the original weights separately and place them there. Generic YOLO weights will not detect this project's pothole class.
+- A CUDA-enabled PyTorch installation for NVIDIA GPU inference, or a CPU PyTorch installation.
 
-The new Python requirements are only the FastAPI server and multipart upload parser. Install into the existing `.venv`; do not recreate the environment or install/upgrade PyTorch, NumPy, or Ultralytics.
+Windows installation instructions for both GPU and CPU are in [SETUP_WINDOWS.md](SETUP_WINDOWS.md). The GPU instructions are tailored to the RTX 50-series/CUDA 12.8 environment used during development. On other systems, install a PyTorch build appropriate to your hardware, then install the Python packages required by the backend.
 
-## Install and start
+## Start the app
 
-From the project root:
+From the repository root, after following the platform setup instructions:
 
-```bash
-source .venv/bin/activate
-python -m pip install -r backend/requirements.txt
-python -m backend.main
+```powershell
+.\.venv\Scripts\python.exe -m backend.main
 ```
 
-The backend listens at `http://127.0.0.1:8000`. In a second terminal, from the project root:
+In a second terminal:
 
-```bash
+```powershell
 cd frontend
-npm install
-npm run dev
+npm.cmd ci
+npm.cmd run dev
 ```
 
-Open **http://127.0.0.1:5173** in your browser. Keep both terminals running.
+Open **http://127.0.0.1:5173**. On macOS/Linux, activate your Python environment and use `python -m backend.main`, `npm ci`, and `npm run dev` instead. The API runs at **http://127.0.0.1:8000**; `/api/health` reports whether the model and bundled demo video are present and which inference device was selected.
 
-To show lane candidates, camera path, edges, and the approximate road mask in the processed feed, start the backend with `DEBUG_LANES=true python -m backend.main` (after activating `.venv`). Run the smoke checks with `.venv/bin/python test_lane_pipeline.py`.
+## Use it
 
-## Run the demo or upload a video
+1. Choose an MP4 video or select **Try the demo** to process `assets/final.mp4`. You can also drop an MP4 onto the page. The upload limit is 500 MB.
+2. Wait for processing to finish. The result page then shows the annotated video and simple counts. A warning appears over the video at qualifying playback times.
+3. Open **Detailed dashboard** for lane confidence, visual risk estimates, the tracked-event log, and a list of warning times. Its **Presentation view** button returns to the minimal page. Switching views keeps the current playback position.
 
-1. Open the dashboard and click **Run demo** to process `assets/final.mp4`.
-2. Or click **Upload video** (or drop a file onto the page) and choose an MP4. The upload limit is 500 MB.
-3. Processing status and progress appear above the player. When complete, the processed video is displayed in the page with native play, pause, seek, volume, and fullscreen controls. Detection statistics and the unique event log update with the result.
+Processed inputs, annotated videos, and JSON results are written under `runs/dashboard/<job-id>/`. This directory is ignored by Git. The bundled demo clip is tracked in `assets/final.mp4`; the model weights and local test videos are not.
 
-Processed inputs, annotated videos, and a `results.json` copy are stored under ignored `runs/dashboard/<job-id>/` folders. Results report ego-lane, adjacent-road, outside-road, uncertain-lane, and lane-confidence values. API endpoints are `POST /api/process`, `POST /api/process/demo`, `GET /api/status/{job_id}`, `GET /api/results/{job_id}`, and `GET /api/video/{job_id}`. `/api/health` reports backend/model/demo availability.
+## How it works
 
-## Current-lane filtering
+```text
+Uploaded MP4
+   ↓ FFmpeg frame decoding
+YOLOv8 pothole detection + OpenCV lane estimation
+   ↓ lane association and centroid tracking
+Annotated MP4 + JSON results + playback warning intervals
+   ↓
+React results page / detailed dashboard
+```
 
-Inspection note: the original working video path loads `models/best.pt` in `backend/detector.py`, calls YOLO per decoded frame in `backend/video_processor.py`, writes an annotated H.264 MP4 with FFmpeg, then returns its JSON results through FastAPI for the React player and statistics cards. The old documentation referred to a fixed trapezoid; the lane polygon is now built from frame-derived OpenCV Canny/Hough line candidates fitted to curved boundaries.
+The backend processes frames in order. YOLO detects candidate potholes at a 0.25 confidence threshold; OpenCV estimates lane boundaries from visible markings. The bottom-center of each pothole box is compared with the current-lane region. A lightweight tracker groups detections across adjacent frames into events. When lane confidence is insufficient, detections are marked uncertain instead of being assigned to the current lane.
 
-The detector selects the nearest plausible visible marking on either side of the configured camera path, fits and temporally smooths a curve, and forms a polygon between those observed boundaries. It has no fixed-polygon fallback: when the boundary confidence decays below threshold, the video labels the lane uncertain and potholes are excluded from ego-lane severity totals. Lane confidence is a line-support/vertical-coverage heuristic, not a calibrated probability. `camera_x` is the normalized camera optical-path position, not a selected left/right lane; tune it along with `LANE_CONFIG` for a different camera position, crop, lighting, or road. `DEBUG_LANES=true` adds candidate Hough lines, the camera path, edge map, and approximate low-chroma road mask.
+An early warning interval requires at least two observations of a tracked pothole in the current lane, detection confidence of at least 0.35, and a box bottom above 72% of image height. This is only a visual “farther up the frame” rule. It does not estimate meters to the pothole. The detailed dashboard shows a visual risk score from box area, confidence, and image position; it does not measure physical severity or depth.
 
-Each YOLO box is associated using its bottom-center point. Points inside the detected ego-lane polygon count as relevant; points outside it are further classified against a low-chroma road-surface mask as adjacent roadway or outside-road. The road mask is a lightweight color heuristic and should be calibrated for different pavement/lighting; uncertain lane frames are kept out of primary risk statistics rather than guessed.
+YOLO runs on the selected CUDA device when available. FFmpeg decoding/encoding and OpenCV lane estimation still run on CPU. Set `YOLO_DEVICE=cpu` to force CPU or `YOLO_DEVICE=cuda:0` to require the first GPU. The default is `auto`. See [SETUP_WINDOWS.md](SETUP_WINDOWS.md) for PowerShell examples.
 
-Pothole boxes are rendered in red, while lane overlays retain their separate lane color. A 160×90 grayscale thumbnail is sampled once per second; the median luminance classifies the processed clip as DAY or NIGHT using a threshold in `backend/vehicle_status.py`. This is a scene-lighting indicator, not weather detection. The supplied video has no usable GPS/CAN speed or calibrated scene scale, so the API returns `speed_kmh: null` and the UI displays `N/A`; it does not invent a real-world speed.
+## API
 
-The HTML video element uses native controls with autoplay disabled. A compact control row adds playback time, restart, and playback-rate choices. Physical pothole depth is explicitly reported as not available.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/health` | Model/demo availability and inference device |
+| `POST /api/process` | Upload an MP4 and start a job |
+| `POST /api/process/demo` | Start a job with the bundled demo clip |
+| `GET /api/status/{job_id}` | Processing state and progress |
+| `GET /api/results/{job_id}` | Counts, events, lane data, and `forward_alerts` |
+| `GET /api/video/{job_id}` | Stream the completed annotated MP4 |
 
-## Tracking and severity
+## Checks
 
-The lightweight centroid tracker in `backend/tracker.py` associates nearby pothole bottom-centers between frames and allows short detection gaps. Repeated appearances of one object become one event; the detection table records its first frame and the annotated video shows its tracked ID. Very long gaps, rapid camera changes, or similar potholes close together can still split or merge tracks.
+With the Python environment installed:
 
-`backend/severity.py` produces a transparent **visual risk estimate**, not a depth measurement. Its score is `0.50 × normalized box area + 0.25 × confidence + 0.25 × proximity`, where box area is normalized to 8% of the image and proximity increases as the box reaches the lower part of the frame. Defaults classify scores below 0.38 as LOW, below 0.67 as MEDIUM, and the rest as HIGH. Constants are configurable there. These values should be calibrated against the intended demonstration and are not validated road-safety thresholds.
+```powershell
+.\.venv\Scripts\python.exe -m unittest test_forward_alerts test_lane_tracking test_inference_device -v
+.\.venv\Scripts\python.exe test_lane_pipeline.py
+cd frontend
+npm.cmd run build
+```
+
+The lane-pipeline smoke check loads `models/best.pt` and needs the bundled demo video. The unit tests cover warning intervals, lane stability, and inference-device selection.
 
 ## Limitations
 
-- Lane geometry uses OpenCV edge/Hough candidates rather than a learned lane-segmentation model. Faded markings, intersections, shadows, unusual pavement colors, sharp curves, camera motion, and lane changes can reduce confidence; the camera path calibration and thresholds may need tuning.
-- The road-surface mask is a low-chroma/value heuristic, not semantic road segmentation. Adjacent-versus-outside-road labels can be uncertain on gravel, concrete, wet, or strongly shadowed roads.
-- Current-lane classification uses the bounding-box bottom-center; uncertain or partly occluded road contacts may be assigned incorrectly.
-- Severity is a visual risk estimate only. It does **not** measure physical pothole depth in centimeters. Depth measurement needs additional calibrated stereo/depth sensors or another validated measurement method.
-- Centroid tracking is intentionally lightweight; challenging occlusion and crowded detections can affect unique counts.
-- In-memory job state resets when the backend restarts. This is intended for local project demonstrations.
+- This is **batch processing**. It does not read a live vehicle camera, measure end-to-end warning latency, or provide a driving-safety guarantee.
+- The pothole model and lane thresholds were tested on limited footage. Faded markings, curves, shadows, rain, night scenes, camera motion, and different road surfaces can reduce accuracy. Counts may include false detections.
+- Lane association is based on a box contact point and estimated lane geometry. Tracking can split or merge nearby potholes.
+- “Pothole ahead” is based on image height and cannot determine actual distance or time to contact. The risk score is visual only. There is no calibrated speed, physical pothole depth, or road-surface height estimate.
+- Job state is held in memory and is lost when the backend restarts. Files under `runs/dashboard/` remain on disk.
 
-## Original inference
-
-The original command remains available from the project root:
-
-```bash
-source .venv/bin/activate
-python Pothole_Detection.py
-```
-
-It continues to use `models/best.pt` on `assets/final.mp4` and save the YOLO output under `runs/detect/predict/`.
+The original inference notebook and project report remain in the repository for reference. The dashboard uses the existing trained weights without retraining them.

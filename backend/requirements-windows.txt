@@ -1,0 +1,10 @@
+# Fresh Windows CPU environment, Python 3.11.
+# Install torch==2.2.2 and torchvision==0.17.2 first from:
+# https://download.pytorch.org/whl/cpu
+-r requirements.txt
+torch==2.2.2
+torchvision==0.17.2
+ultralytics==8.0.200
+numpy==1.26.4
+opencv-python==4.10.0.84
+pandas<3

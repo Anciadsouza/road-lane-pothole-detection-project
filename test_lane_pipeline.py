@@ -1,4 +1,4 @@
-"""CPU checks for model inference and the lane-aware video pipeline.
+"""Checks for model inference on the selected device and the lane-aware pipeline.
 
 Run from the repository root with: .venv/bin/python test_lane_pipeline.py
 Optional previously uploaded condition clips under runs/dashboard are included
@@ -88,10 +88,11 @@ def main() -> None:
         expired = lane_detector.update(blank, 60 + step)
     assert expired is not None and not expired.reliable and expired.tracking_status == "UNCERTAIN"
 
-    # YOLO weights, confidence threshold, source pixels, and CPU inference remain unchanged.
+    # Keep the weights, confidence threshold, and source pixels unchanged.
     model = load_model()
+    device = str(model.device)
     prediction = model.predict(source_snapshot.copy(), conf=0.25, imgsz=640,
-                               device="cpu", verbose=False)[0]
+                               device=device, verbose=False)[0]
     assert prediction.boxes is not None, "YOLO prediction did not return box results"
 
     tracker = CentroidTracker()
@@ -126,7 +127,7 @@ def main() -> None:
     assert classify_lighting([120, 135, 128])[0] == "DAY"
     assert classify_lighting([20, 35, 28])[0] == "NIGHT"
     assert vehicle_speed_status()["speed_kmh"] is None
-    print("PASS: existing model loads and runs on CPU")
+    print(f"PASS: existing model loads and runs on {device}")
     print("PASS: lane polygon, road point association, centerline and convergence estimate")
     print("PASS: 8-frame occlusion grace followed by honest uncertain state")
     print("PASS: YOLO source remains unchanged and original inference settings are retained")
