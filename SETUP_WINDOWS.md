@@ -60,9 +60,9 @@ NumPy and OpenCV are pinned to avoid installing NumPy 2 into that older inferenc
 stack. This file sets up a fresh environment; it does not upgrade an existing
 working macOS environment.
 
-Obtain the original trained pothole weights from the project owner and place them
-at `models/best.pt`. The repository excludes that directory. Generic YOLO weights
-are not a replacement for this project's pothole model.
+The trained pothole weights are included at `models/best.pt`. Keep this file in
+place when setting up a fresh clone. Generic YOLO weights are not a replacement
+for this project's pothole model.
 
 Start the API:
 

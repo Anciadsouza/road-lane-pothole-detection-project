@@ -17,7 +17,7 @@ The amber warning uses image position, **not measured distance**. Speed, pothole
 ## Requirements
 
 - Python 3.11, Node.js/npm, FFmpeg and FFprobe on `PATH`.
-- The trained pothole weights at **`models/best.pt`**. The `models/` directory is excluded from Git, so obtain the original weights separately and place them there. Generic YOLO weights will not detect this project's pothole class.
+- The trained pothole weights at **`models/best.pt`**, included in this repository. Generic YOLO weights will not detect this project's pothole class.
 - A CUDA-enabled PyTorch installation for NVIDIA GPU inference, or a CPU PyTorch installation.
 
 Windows installation instructions for both GPU and CPU are in [SETUP_WINDOWS.md](SETUP_WINDOWS.md). The GPU instructions are tailored to the RTX 50-series/CUDA 12.8 environment used during development. On other systems, install a PyTorch build appropriate to your hardware, then install the Python packages required by the backend.
@@ -46,7 +46,7 @@ Open **http://127.0.0.1:5173**. On macOS/Linux, activate your Python environment
 2. Wait for processing to finish. The result page then shows the annotated video and simple counts. A warning appears over the video at qualifying playback times.
 3. Open **Detailed dashboard** for lane confidence, visual risk estimates, the tracked-event log, and a list of warning times. Its **Presentation view** button returns to the minimal page. Switching views keeps the current playback position.
 
-Processed inputs, annotated videos, and JSON results are written under `runs/dashboard/<job-id>/`. This directory is ignored by Git. The bundled demo clip is tracked in `assets/final.mp4`; the model weights and local test videos are not.
+Processed inputs, annotated videos, and JSON results are written under `runs/dashboard/<job-id>/`. This directory is ignored by Git. The bundled demo clip is tracked in `assets/final.mp4`, and the trained model is tracked in `models/best.pt`. Local test videos are not included.
 
 ## How it works
 

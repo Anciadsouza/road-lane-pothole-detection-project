@@ -4,7 +4,8 @@ __pycache__/
 .DS_Store
 assets/.DS_Store
 runs/
-models/
+models/*
+!models/best.pt
 Pothole_Detection.py
 test_pothole.py
 Pothole-Detection-Project--1/
