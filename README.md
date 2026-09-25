@@ -8,11 +8,11 @@ Roadwatch analyzes **recorded road videos** with the project's trained YOLOv8 po
 
 - Annotated MP4 with pothole boxes and the estimated current-lane region.
 - Counts for potholes in the current lane and outside it, plus a tracked-event log in the detailed view.
-- An amber **Pothole ahead** message during playback when a tracked current-lane pothole was repeatedly detected farther up the frame.
+- An amber **Pothole ahead** warning during playback, with an approximate distance that updates as the tracked pothole moves through the video.
 - Local GPU inference when a compatible CUDA-enabled PyTorch installation is available; CPU is the fallback.
 - A visual risk estimate and a DAY/NIGHT scene indicator in the detailed view.
 
-The amber warning uses image position, **not measured distance**. Speed, pothole depth, and stopping time are not measured by this project.
+The warning distance is an adjustable camera-geometry estimate based on pothole position in the image. In the results view, expand **Adjust distance estimate for this camera** to set camera height, downward pitch, and vertical field of view. The default values are generic assumptions; the estimate assumes a flat road and is not a calibrated measurement. Speed, pothole depth, and stopping time are not measured.
 
 ## Requirements
 
@@ -95,7 +95,7 @@ The lane-pipeline smoke check loads `models/best.pt` and needs the bundled demo 
 - This is **batch processing**. It does not read a live vehicle camera, measure end-to-end warning latency, or provide a driving-safety guarantee.
 - The pothole model and lane thresholds were tested on limited footage. Faded markings, curves, shadows, rain, night scenes, camera motion, and different road surfaces can reduce accuracy. Counts may include false detections.
 - Lane association is based on a box contact point and estimated lane geometry. Tracking can split or merge nearby potholes.
-- “Pothole ahead” is based on image height and cannot determine actual distance or time to contact. The risk score is visual only. There is no calibrated speed, physical pothole depth, or road-surface height estimate.
+- Estimated distance uses a pinhole-camera/flat-road approximation with user-adjustable camera height, pitch, and vertical field of view. Without camera calibration and a level road surface, the displayed meters may be inaccurate; this is a prototype feature, not a safety-rated driving warning. It does not estimate time to contact. The risk score is visual only. Speed and physical pothole depth are not measured.
 - Job state is held in memory and is lost when the backend restarts. Files under `runs/dashboard/` remain on disk.
 
 The original inference notebook and project report remain in the repository for reference. The dashboard uses the existing trained weights without retraining them.

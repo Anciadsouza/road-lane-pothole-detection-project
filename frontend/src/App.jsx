@@ -4,6 +4,35 @@ import PresentationDashboard from './PresentationDashboard.jsx'
 
 const API = 'http://127.0.0.1:8000/api'
 const emptyStats = { total_unique_potholes: 0, current_lane_potholes: 0, adjacent_lane_potholes: 0, outside_road_potholes: 0, ignored_potholes: 0, lane_status: 'UNCERTAIN', lane_detection_confidence: 0, average_confidence: 0, lighting_condition: '—', speed_kmh: null, speed_label: 'N/A', driving_direction: 'Forward', high_risk: 0, medium_risk: 0, low_risk: 0, raw_yolo_detections: 0, detections: [], forward_alerts: [] }
+const DEFAULT_DISTANCE_CALIBRATION = { cameraHeightM: 1.4, cameraPitchDeg: 8, verticalFovDeg: 50 }
+
+function estimateAlertDistance(alert, timeSeconds, calibration) {
+  const samples = alert?.distance_samples
+  if (!samples?.length) return null
+  const height = Number(calibration.cameraHeightM)
+  const pitch = Number(calibration.cameraPitchDeg)
+  const verticalFov = Number(calibration.verticalFovDeg)
+  if (!(height >= 0.5 && height <= 4) || !(pitch >= 0 && pitch <= 30) || !(verticalFov >= 20 && verticalFov <= 100)) return null
+
+  let contactY = samples[0].contact_y_fraction
+  if (timeSeconds >= samples[samples.length - 1].time_seconds) contactY = samples[samples.length - 1].contact_y_fraction
+  else if (timeSeconds > samples[0].time_seconds) {
+    const rightIndex = samples.findIndex(sample => sample.time_seconds >= timeSeconds)
+    const left = samples[Math.max(0, rightIndex - 1)]
+    const right = samples[rightIndex]
+    const span = right.time_seconds - left.time_seconds
+    const portion = span > 0 ? (timeSeconds - left.time_seconds) / span : 0
+    contactY = left.contact_y_fraction + (right.contact_y_fraction - left.contact_y_fraction) * portion
+  }
+
+  const fovRadians = verticalFov * Math.PI / 180
+  const pitchRadians = pitch * Math.PI / 180
+  const focalLengthInFrameHeights = 0.5 / Math.tan(fovRadians / 2)
+  const rayAngle = pitchRadians + Math.atan((contactY - 0.5) / focalLengthInFrameHeights)
+  if (!(rayAngle > 0 && rayAngle < Math.PI / 2)) return null
+  const distance = height / Math.tan(rayAngle)
+  return Number.isFinite(distance) && distance > 0 && distance <= 200 ? distance : null
+}
 
 function formatTime(value) {
   if (!Number.isFinite(value)) return '00:00'
@@ -25,6 +54,12 @@ function App() {
   const [dragging, setDragging] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
   const [playbackTime, setPlaybackTime] = useState({ current: 0, duration: 0 })
+  const [distanceCalibration, setDistanceCalibration] = useState(() => {
+    try { return { ...DEFAULT_DISTANCE_CALIBRATION, ...JSON.parse(localStorage.getItem('roadwatch-distance-calibration') || '{}') } }
+    catch { return DEFAULT_DISTANCE_CALIBRATION }
+  })
+
+  useEffect(() => { localStorage.setItem('roadwatch-distance-calibration', JSON.stringify(distanceCalibration)) }, [distanceCalibration])
 
   useEffect(() => { fetch(`${API}/health`).then(r => r.ok ? r.json() : Promise.reject()).then(x => { setService(x.model_available ? 'online' : 'model-missing'); setRuntime(x) }).catch(() => setService('offline')) }, [])
   useEffect(() => {
@@ -73,6 +108,8 @@ function App() {
   const alerts = complete ? stats.forward_alerts || [] : []
   const activeAlerts = alerts.filter(alert => playbackTime.current >= alert.start_seconds && playbackTime.current <= alert.end_seconds)
   const activeAlert = activeAlerts[0]
+  const activeDistances = activeAlerts.map(alert => estimateAlertDistance(alert, playbackTime.current, distanceCalibration)).filter(Number.isFinite)
+  const activeDistanceM = activeDistances.length ? Math.min(...activeDistances) : null
   const nextAlert = alerts.find(alert => alert.start_seconds > playbackTime.current)
   function jumpToAlert(alert) {
     const video = videoRef.current
@@ -96,7 +133,8 @@ function App() {
 
   if (view === 'presentation') return <PresentationDashboard
     stats={stats} job={job} busy={busy} complete={complete} sourceName={sourceName}
-    activeAlerts={activeAlerts} playbackTime={playbackTime}
+    activeAlerts={activeAlerts} playbackTime={playbackTime} activeDistanceM={activeDistanceM}
+    distanceCalibration={distanceCalibration} onCalibrationChange={(key, value) => setDistanceCalibration(current => ({ ...current, [key]: Number(value) }))}
     videoUrl={videoUrl} videoRef={videoRef} onVideoLoaded={handleVideoLoaded}
     onTimeUpdate={event => setPlaybackTime({ current: event.currentTarget.currentTime, duration: event.currentTarget.duration || 0 })}
     onDemo={startDemo} onUpload={upload} onDetailedView={() => setView('detailed')}
@@ -115,7 +153,7 @@ function App() {
             <div className="panel-top"><div><div className="section-kicker"><span className="kicker-bar"/>VIDEO ANALYSIS</div><h2>Road feed</h2></div><div className="feed-meta"><span className="rec-dot"/>{complete ? 'PROCESSED' : busy ? 'ANALYZING' : 'AWAITING INPUT'}<span className="meta-divider"/>{complete && stats.fps ? `${Math.round(stats.fps)} FPS` : 'MP4 INPUT'}</div></div>
             <div className={`forward-alert-banner ${activeAlert ? 'is-active' : ''}`} role="status" aria-live="polite">
               <div className="forward-alert-symbol">{activeAlert ? <AlertTriangle size={21}/> : <ShieldCheck size={20}/>}</div>
-              <div className="forward-alert-copy"><span className="forward-alert-kicker">{activeAlert ? 'EARLY ROAD WARNING' : 'FORWARD HAZARD MONITOR'}</span><strong>{activeAlert ? activeAlerts.length > 1 ? `${activeAlerts.length} potholes ahead in your lane` : 'Pothole ahead in your lane' : busy ? 'Scanning the road ahead' : complete ? nextAlert ? 'Road clear at this moment' : 'No upcoming far-ahead alerts' : 'Ready to scan the road ahead'}</strong><small>{activeAlert ? activeAlerts.length > 1 ? `Tracked objects ${activeAlerts.map(alert => `#${alert.object_id}`).join(', ')} · farther up the frame` : `Tracked object #${activeAlert.object_id} · detected farther up the frame` : busy ? 'Alerts appear after the video finishes processing.' : complete && nextAlert ? `Next early alert at ${formatTime(nextAlert.start_seconds)}` : 'Alerts use image position, not measured distance.'}</small></div>
+              <div className="forward-alert-copy"><span className="forward-alert-kicker">{activeAlert ? 'EARLY ROAD WARNING' : 'FORWARD HAZARD MONITOR'}</span><strong>{activeAlert ? activeAlerts.length > 1 ? `${activeAlerts.length} potholes ahead in your lane` : 'Pothole ahead in your lane' : busy ? 'Scanning the road ahead' : complete ? nextAlert ? 'Road clear at this moment' : 'No upcoming far-ahead alerts' : 'Ready to scan the road ahead'}</strong><small>{activeAlert ? `${activeAlerts.length > 1 ? `Tracked objects ${activeAlerts.map(alert => `#${alert.object_id}`).join(', ')}` : `Tracked object #${activeAlert.object_id}`} · ${activeDistanceM == null ? 'distance estimate unavailable' : `estimated distance ${activeDistanceM.toFixed(1)} m`} · approximate` : busy ? 'Alerts appear after the video finishes processing.' : complete && nextAlert ? `Next early alert at ${formatTime(nextAlert.start_seconds)}` : 'Distance is an adjustable camera-based estimate.'}</small></div>
               <span className={`forward-alert-status ${activeAlert ? 'warning' : ''}`}>{activeAlert ? 'POTHOLE AHEAD' : 'MONITORING'}</span>
               {!activeAlert && nextAlert && <button className="forward-alert-skip" onClick={() => jumpToAlert(nextAlert)} title="Jump to next early alert"><ChevronRight size={16}/></button>}
             </div>
