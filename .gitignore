@@ -18,3 +18,5 @@ Major Project/
 assets/Car_driving_on_Indian_road_*.mp4
 /download (*)
 /best.pt*.metadata
+
+frontend/.env.local

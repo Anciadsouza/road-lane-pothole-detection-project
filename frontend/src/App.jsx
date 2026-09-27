@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Activity, AlertTriangle, ArrowUpRight, Check, ChevronRight, CircleHelp, CloudUpload, Compass, Gauge, HardDrive, Moon, Play, RotateCcw, Route, ShieldCheck, Sun, Video, Wifi, X } from 'lucide-react'
 import PresentationDashboard from './PresentationDashboard.jsx'
 
-const API = 'http://127.0.0.1:8000/api'
+const API = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api'
 const emptyStats = { total_unique_potholes: 0, current_lane_potholes: 0, adjacent_lane_potholes: 0, outside_road_potholes: 0, ignored_potholes: 0, lane_status: 'UNCERTAIN', lane_detection_confidence: 0, average_confidence: 0, lighting_condition: '—', speed_kmh: null, speed_label: 'N/A', driving_direction: 'Forward', high_risk: 0, medium_risk: 0, low_risk: 0, raw_yolo_detections: 0, detections: [], forward_alerts: [] }
 const DEFAULT_DISTANCE_CALIBRATION = { cameraHeightM: 1.4, cameraPitchDeg: 8, verticalFovDeg: 50 }
 
@@ -34,6 +34,42 @@ function estimateAlertDistance(alert, timeSeconds, calibration) {
   return Number.isFinite(distance) && distance > 0 && distance <= 200 ? distance : null
 }
 
+function estimateAlertCueTime(alert, calibration) {
+  const samples = alert?.distance_samples || []
+  if (samples.length < 2) return null
+  const points = samples.map(sample => ({
+    time: sample.time_seconds,
+    distance: estimateAlertDistance(alert, sample.time_seconds, calibration),
+  })).filter(point => Number.isFinite(point.distance))
+  if (points.length < 2) return null
+  const meanTime = points.reduce((sum, point) => sum + point.time, 0) / points.length
+  const meanDistance = points.reduce((sum, point) => sum + point.distance, 0) / points.length
+  const variance = points.reduce((sum, point) => sum + (point.time - meanTime) ** 2, 0)
+  if (variance < 0.0001) return null
+  const slope = points.reduce((sum, point) => sum + (point.time - meanTime) * (point.distance - meanDistance), 0) / variance
+  const closingSpeed = -slope
+  if (!(closingSpeed > 0.5 && closingSpeed < 40)) return null
+  const last = points[points.length - 1]
+  const estimatedArrival = last.time + last.distance / closingSpeed
+  const cueTime = estimatedArrival - 2.5
+  return cueTime >= 0 ? cueTime : null
+}
+
+function playWarningSound(context, startAt = context.currentTime) {
+  const now = startAt
+  const oscillator = context.createOscillator()
+  const gain = context.createGain()
+  oscillator.type = 'square'
+  oscillator.frequency.setValueAtTime(980, now)
+  gain.gain.setValueAtTime(0.001, now)
+  gain.gain.linearRampToValueAtTime(0.9, now + 0.015)
+  gain.gain.setValueAtTime(0.9, now + 0.18)
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.24)
+  oscillator.connect(gain)
+  gain.connect(context.destination)
+  oscillator.start(now)
+  oscillator.stop(now + 0.25)
+}
 function formatTime(value) {
   if (!Number.isFinite(value)) return '00:00'
   const seconds = Math.floor(value)
@@ -54,6 +90,9 @@ function App() {
   const [dragging, setDragging] = useState(false)
   const [playbackRate, setPlaybackRate] = useState(1)
   const [playbackTime, setPlaybackTime] = useState({ current: 0, duration: 0 })
+  const audioContextRef = useRef(null)
+  const alertSoundedKeysRef = useRef(new Set())
+  const nextWarningBeepTimeRef = useRef(0)
   const [distanceCalibration, setDistanceCalibration] = useState(() => {
     try { return { ...DEFAULT_DISTANCE_CALIBRATION, ...JSON.parse(localStorage.getItem('roadwatch-distance-calibration') || '{}') } }
     catch { return DEFAULT_DISTANCE_CALIBRATION }
@@ -106,16 +145,54 @@ function App() {
   const deviceName = stats.inference_device_name ?? runtime?.inference_device_name ?? 'Checking inference device'
   const complete = job?.status === 'completed'
   const alerts = complete ? stats.forward_alerts || [] : []
-  const activeAlerts = alerts.filter(alert => playbackTime.current >= alert.start_seconds && playbackTime.current <= alert.end_seconds)
+  const activeAlerts = alerts.filter(alert => {
+    const cueTime = estimateAlertCueTime(alert, distanceCalibration)
+    const warningStart = cueTime ?? alert.start_seconds
+    const warningEnd = Math.max(alert.end_seconds, warningStart + 0.35)
+    return playbackTime.current >= warningStart && playbackTime.current <= warningEnd
+  })
   const activeAlert = activeAlerts[0]
   const activeDistances = activeAlerts.map(alert => estimateAlertDistance(alert, playbackTime.current, distanceCalibration)).filter(Number.isFinite)
   const activeDistanceM = activeDistances.length ? Math.min(...activeDistances) : null
+
+  function handleVideoPlay() {
+    if (!audioContextRef.current) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext
+      if (AudioContextClass) audioContextRef.current = new AudioContextClass()
+    }
+    if (audioContextRef.current?.state === 'suspended') audioContextRef.current.resume().catch(() => {})
+  }
+
+  function handleVideoTimeUpdate(event) {
+    const current = event.currentTarget.currentTime
+    const duration = event.currentTarget.duration || 0
+    const isPlaying = !event.currentTarget.paused
+    const context = audioContextRef.current
+    const cuesByPothole = new Map()
+    for (const alert of alerts) {
+      const potholeId = alert.object_id ?? alert.first_frame
+      const cueTime = estimateAlertCueTime(alert, distanceCalibration)
+      if (cueTime == null) continue
+      if (!cuesByPothole.has(potholeId) || cueTime < cuesByPothole.get(potholeId)) cuesByPothole.set(potholeId, cueTime)
+    }
+    for (const [potholeId, cueTime] of [...cuesByPothole].sort((left, right) => left[1] - right[1])) {
+      const key = `${job?.job_id}:${potholeId}`
+      if (current < cueTime - 0.25) alertSoundedKeysRef.current.delete(key)
+      else if (isPlaying && current >= cueTime && !alertSoundedKeysRef.current.has(key) && context?.state === 'running') {
+        const beepAt = Math.max(context.currentTime, nextWarningBeepTimeRef.current)
+        playWarningSound(context, beepAt)
+        nextWarningBeepTimeRef.current = beepAt + 0.32
+        alertSoundedKeysRef.current.add(key)
+      }
+    }
+    setPlaybackTime({ current, duration })
+  }
   const nextAlert = alerts.find(alert => alert.start_seconds > playbackTime.current)
   function jumpToAlert(alert) {
     const video = videoRef.current
     if (!video) return
-    video.currentTime = alert.start_seconds
-    setPlaybackTime(time => ({ ...time, current: alert.start_seconds }))
+    video.currentTime = estimateAlertCueTime(alert, distanceCalibration) ?? alert.start_seconds
+    setPlaybackTime(time => ({ ...time, current: estimateAlertCueTime(alert, distanceCalibration) ?? alert.start_seconds }))
     video.play().catch(() => {})
   }
   const videoUrl = complete ? `${API}/video/${job.job_id}` : ''
@@ -135,8 +212,8 @@ function App() {
     stats={stats} job={job} busy={busy} complete={complete} sourceName={sourceName}
     activeAlerts={activeAlerts} playbackTime={playbackTime} activeDistanceM={activeDistanceM}
     distanceCalibration={distanceCalibration} onCalibrationChange={(key, value) => setDistanceCalibration(current => ({ ...current, [key]: Number(value) }))}
-    videoUrl={videoUrl} videoRef={videoRef} onVideoLoaded={handleVideoLoaded}
-    onTimeUpdate={event => setPlaybackTime({ current: event.currentTarget.currentTime, duration: event.currentTarget.duration || 0 })}
+    videoUrl={videoUrl} videoRef={videoRef} onVideoLoaded={handleVideoLoaded} onVideoPlay={handleVideoPlay}
+    onTimeUpdate={handleVideoTimeUpdate}
     onDemo={startDemo} onUpload={upload} onDetailedView={() => setView('detailed')}
     message={message} onDismissMessage={() => setMessage('')}
   />
@@ -158,7 +235,7 @@ function App() {
               {!activeAlert && nextAlert && <button className="forward-alert-skip" onClick={() => jumpToAlert(nextAlert)} title="Jump to next early alert"><ChevronRight size={16}/></button>}
             </div>
             <div className={`video-stage ${!complete ? 'empty-stage' : ''}`}>
-              {complete ? <video ref={videoRef} key={videoUrl} src={videoUrl} controls playsInline preload="metadata" onLoadedMetadata={handleVideoLoaded} onTimeUpdate={e => setPlaybackTime({ current: e.currentTarget.currentTime, duration: e.currentTarget.duration || 0 })} onRateChange={e => setPlaybackRate(e.currentTarget.playbackRate)} /> : <div className="stage-empty"><div className="road-glyph"><Route size={36}/></div><div className="stage-title">{busy ? 'Analyzing road feed' : 'No video loaded'}</div><div className="stage-copy">{busy ? (job?.message || 'Initializing the vision pipeline…') : 'Load a road video to begin lane-aware pothole analysis.'}</div>{busy && <div className="progress-track"><span style={{ width: `${job?.progress || 3}%` }}/></div>}<div className="stage-mark">{busy ? `${job?.progress || 0}%` : 'MP4 · UP TO 500 MB'}</div></div>}
+              {complete ? <video ref={videoRef} key={videoUrl} src={videoUrl} controls playsInline preload="metadata" onLoadedMetadata={handleVideoLoaded} onPlay={handleVideoPlay} onTimeUpdate={handleVideoTimeUpdate} onRateChange={e => setPlaybackRate(e.currentTarget.playbackRate)} /> : <div className="stage-empty"><div className="road-glyph"><Route size={36}/></div><div className="stage-title">{busy ? 'Analyzing road feed' : 'No video loaded'}</div><div className="stage-copy">{busy ? (job?.message || 'Initializing the vision pipeline…') : 'Load a road video to begin lane-aware pothole analysis.'}</div>{busy && <div className="progress-track"><span style={{ width: `${job?.progress || 3}%` }}/></div>}<div className="stage-mark">{busy ? `${job?.progress || 0}%` : 'MP4 · UP TO 500 MB'}</div></div>}
               {complete && <div className="video-overlay-tag"><span className="live-dot"/>ANNOTATED FEED <span>·</span> CURRENT LANE</div>}
             </div>
             {complete && <div className="playback-extras"><button className="player-tool" onClick={() => { if (videoRef.current) { videoRef.current.pause(); videoRef.current.currentTime = 0; setPlaybackTime(t => ({ ...t, current: 0 })) } }} title="Restart from beginning"><RotateCcw size={14}/> Restart</button><span className="player-time">{formatTime(playbackTime.current)} / {formatTime(playbackTime.duration)}</span><label className="rate-tool">Speed<select aria-label="Playback speed" value={playbackRate} onChange={e => { const rate = Number(e.target.value); setPlaybackRate(rate); if (videoRef.current) videoRef.current.playbackRate = rate }}><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label></div>}
@@ -173,7 +250,7 @@ function App() {
 
         <aside className="sidebar">
           <div className="sidebar-title"><div><div className="section-kicker"><span className="kicker-bar"/>OVERVIEW</div><h2>Detection stats</h2></div><button className="help-button" title="Severity is a visual estimate, not measured depth"><CircleHelp size={17}/></button></div>
-          <div className={`forward-alert-card ${activeAlert ? 'is-active' : ''}`}><div className="forward-alert-card-head"><span><AlertTriangle size={15}/> EARLY ALERTS</span><b>{alerts.length}</b></div><p>{alerts.length ? 'Potholes spotted farther ahead in the current lane.' : complete ? 'No repeated far-ahead potholes were found.' : 'Alert moments will appear after analysis.'}</p>{alerts.length > 0 && <div className="forward-alert-list">{alerts.map((alert, index) => <button key={`${alert.object_id}-${alert.first_frame}-${index}`} className={activeAlert === alert ? 'selected' : ''} onClick={() => jumpToAlert(alert)}><span>#{alert.object_id} POTHOLE AHEAD</span><time>{formatTime(alert.start_seconds)}</time><ChevronRight size={13}/></button>)}</div>}</div>
+          <div className={`forward-alert-card ${activeAlert ? 'is-active' : ''}`}><div className="forward-alert-card-head"><span><AlertTriangle size={15}/> EARLY ALERTS</span><b>{alerts.length}</b></div><p>{alerts.length ? 'Potholes spotted farther ahead in the current lane.' : complete ? 'No repeated far-ahead potholes were found.' : 'Alert moments will appear after analysis.'}</p>{alerts.length > 0 && <div className="forward-alert-list">{alerts.map((alert, index) => <button key={`${alert.object_id}-${alert.first_frame}-${index}`} className={activeAlert === alert ? 'selected' : ''} onClick={() => jumpToAlert(alert)}><span>#{alert.object_id} POTHOLE AHEAD</span><time>{formatTime(estimateAlertCueTime(alert, distanceCalibration) ?? alert.start_seconds)}</time><ChevronRight size={13}/></button>)}</div>}</div>
           <div className="stat-card featured"><div className="stat-top"><span>TOTAL POTHOLES</span><span className="stat-icon"><AlertTriangle size={16}/></span></div><div className="stat-value">{stats.total_unique_potholes}<small> unique</small></div><div className="stat-foot"><span className="accent-text">{stats.raw_yolo_detections}</span> raw detections across video</div></div>
           <div className="lane-card"><div className="lane-card-head"><span className="lane-symbol"><Route size={17}/></span><span>EGO LANE STATUS</span><span className={`active-pill ${laneStateClass}`}><i/>{stats.lane_status}</span></div><div className="lane-card-body"><div className="lane-count">{stats.current_lane_potholes}<small>relevant events · lane {stats.ego_lane ?? '—'}</small></div><div className="lane-visual"><span className="lane-edge left"/><span className="lane-dash"/><span className="lane-edge right"/><span className="lane-car">⌃</span></div></div><div className="lane-risk"><span>LANE DETECTION CONFIDENCE</span><b className={laneConfidenceClass}><i/>{Math.round(laneConfidence * 100)}%</b></div></div>
           <div className="vehicle-status-card"><div className="vehicle-status-head"><span className="section-kicker"><span className="kicker-bar"/>VEHICLE STATUS</span><span className="status-note">VIDEO TELEMETRY</span></div><div className="vehicle-speed"><div><span>SPEED</span><b>{stats.speed_kmh == null ? (stats.speed_label || 'N/A') : `${stats.speed_kmh} km/h`}</b></div><small>{stats.speed_kmh == null ? 'No calibrated speed source' : 'Estimated speed'}</small></div><div className="vehicle-status-pair"><div><span>{stats.lighting_condition === 'NIGHT' ? <Moon size={13}/> : <Sun size={13}/>}LIGHTING</span><b className={stats.lighting_condition === 'NIGHT' ? 'night-state' : 'day-state'}>{stats.lighting_condition || '—'}</b></div><div><span><Compass size={13}/>DIRECTION</span><b>{stats.driving_direction || 'Forward'}</b></div></div></div>

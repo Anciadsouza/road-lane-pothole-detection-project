@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("pothole_dashboard")
 
 app = FastAPI(title="Pothole Detection Dashboard", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
                    allow_methods=["GET", "POST"], allow_headers=["*"])
 jobs: dict[str, dict] = {}
 jobs_lock = threading.Lock()
